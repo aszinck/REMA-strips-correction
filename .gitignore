@@ -3,3 +3,4 @@
 
 # Ignore test notebook
 /tester.ipynb
+.DS_Store
