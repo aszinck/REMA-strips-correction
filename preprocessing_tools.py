@@ -1016,7 +1016,9 @@ def _coreg_process_one(path_str, config):
             row[f'rmse_{name.lower()}_before'] = _coreg_rmse(before[mask])
             row[f'rmse_{name.lower()}_after'] = _coreg_rmse(after[mask])
         if row['rmse_after'] > config['max_rmse_m']: flags.append('HIGH_RMSE')
-        if row['rmse_after'] > row['rmse_before']: flags.append('RMSE_INCREASED')
+        if row['weighted_rmse_after'] > row['weighted_rmse_before']: flags.append('RMSE_INCREASED')
+        row['rejected_fraction'] = row['n_rejected'] / len(data)
+        if row['rejected_fraction'] > config['max_rejected_fraction']: flags.append('HIGH_REJECTION')
         row['quality_flags'] = ';'.join(flags)
         output = config['output_dir'] / f'{path.stem}_coreg.tif'
         if config['overwrite'] or not output.exists():
@@ -1029,30 +1031,75 @@ def _coreg_process_one(path_str, config):
     return row
 
 
+def _coreg_paths(region_id, projectDir):
+    root = Path(projectDir)
+    rema = root / 'data/initial/REMA' / f'region-{region_id}'
+    return dict(strip_dir=rema / 'REMA_strips_tide_corrected',
+                metadata_dir=rema / 'metadataFiles',
+                poca_dir=root / 'data/initial/cryoswath/L2_poca_corrected',
+                swath_file=root / 'data/initial/cryoswath/L2_swath_corrected/swath_corrected_monthly_500m.nc',
+                output_dir=root / 'data/interim' / f'region-{region_id}' / 'REMA/co-registered-strips')
+
+
+def coreg_reference_points(strip, region_id, projectDir, poca_total_weight=5.0,
+                           swath_total_weight=1.0, second_pass_threshold_m=15.0,
+                           min_points_for_plane=10):
+    """Re-create the reference points and fit used by `coregistration` for one strip.
+
+    Use the same fit parameters as in the `coregistration` call. Returns the points
+    (with residuals before and after correction, and whether they were kept in the
+    second pass) and a dict with the fitted plane.
+    """
+    paths = _coreg_paths(region_id, projectDir)
+    path = paths['strip_dir'] / strip
+    config = dict(poca_total_weight=poca_total_weight, swath_total_weight=swath_total_weight,
+                  second_pass_threshold_m=second_pass_threshold_m,
+                  min_points_for_plane=min_points_for_plane)
+    t1, t2 = get_rema_acquisition_times(paths['metadata_dir'] / f'{get_rema_base_name(strip)}_mdf.txt')
+    when = pd.Timestamp(t1) + (pd.Timestamp(t2) - pd.Timestamp(t1)) / 2
+    when = when.tz_localize('UTC') if when.tzinfo is None else when.tz_convert('UTC')
+    months = _coreg_months(when)
+    with rasterio.open(path) as src:
+        bounds = src.bounds
+    poca = _coreg_sample(path, _coreg_poca(months, bounds, paths['poca_dir']))
+    swath = _coreg_sample(path, _coreg_swath(months, bounds, paths['swath_file']))
+    frames = [d for d in (poca, swath) if not d.empty]
+    if not frames:
+        return _coreg_empty(), None
+    data = pd.concat(frames, ignore_index=True)
+    coeff, x0, y0, mode, inliers = _coreg_two_pass(data, bounds, config)
+    data['residual_after'] = _coreg_residual(data, coeff, x0, y0)
+    data['kept'] = inliers
+    data['weight'] = _coreg_weights(data, config)
+    fit = dict(a=coeff[0], b=coeff[1], c=coeff[2], x0=x0, y0=y0, fit_mode=mode)
+    return data, fit
+
+
 def coregistration(region_id, projectDir, cores=3, qc_resolution_m=2000,
                    poca_total_weight=5.0, swath_total_weight=1.0,
                    second_pass_threshold_m=15.0, min_points_for_plane=10,
                    min_poca=10, min_swath=20, min_footprint_coverage=0.20,
-                   min_covered_quadrants=3, max_rmse_m=10.0, overwrite=False):
+                   min_covered_quadrants=3, max_rmse_m=10.0, max_rejected_fraction=0.5,
+                   overwrite=False):
     """Co-register tide-corrected REMA strips against corrected POCA and monthly swath.
 
     Parameters are configurable from a notebook. Returns a QC pandas DataFrame.
+    RMSE_INCREASED compares the weighted RMSE (the quantity the fit minimises).
+    HIGH_REJECTION is raised when more than max_rejected_fraction of the reference
+    points are rejected in the second pass, which usually means the DEM itself is bad.
     Output filenames preserve the input DEM resolution suffix and add '_coreg'.
     """
-    root = Path(projectDir)
-    rema = root / 'data/initial/REMA' / f'region-{region_id}'
-    output = root / 'data/interim' / f'region-{region_id}' / 'REMA/co-registered-strips'
-    config = dict(metadata_dir=rema / 'metadataFiles',
-                  poca_dir=root / 'data/initial/cryoswath/L2_poca_corrected',
-                  swath_file=root / 'data/initial/cryoswath/L2_swath_corrected/swath_corrected_monthly_500m.nc',
-                  output_dir=output, qc_resolution_m=qc_resolution_m,
+    coreg_paths = _coreg_paths(region_id, projectDir)
+    output = coreg_paths['output_dir']
+    config = dict(metadata_dir=coreg_paths['metadata_dir'], poca_dir=coreg_paths['poca_dir'],
+                  swath_file=coreg_paths['swath_file'], output_dir=output, qc_resolution_m=qc_resolution_m,
                   poca_total_weight=poca_total_weight, swath_total_weight=swath_total_weight,
                   second_pass_threshold_m=second_pass_threshold_m,
                   min_points_for_plane=min_points_for_plane, min_poca=min_poca,
                   min_swath=min_swath, min_footprint_coverage=min_footprint_coverage,
                   min_covered_quadrants=min_covered_quadrants, max_rmse_m=max_rmse_m,
-                  overwrite=overwrite)
-    strip_dir = rema / 'REMA_strips_tide_corrected'
+                  max_rejected_fraction=max_rejected_fraction, overwrite=overwrite)
+    strip_dir = coreg_paths['strip_dir']
     paths = sorted(p for p in strip_dir.glob('*.tif') if re.search(r'_dem(?:_[0-9.]+m)?\.tif$', p.name))
     if not paths:
         raise FileNotFoundError(f'No tide-corrected REMA strips found in {strip_dir}')

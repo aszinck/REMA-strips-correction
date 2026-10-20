@@ -26,14 +26,42 @@ The full workflow is in `data-preprocessing.ipynb`. Most of the logic lives in `
 
 4. **Tide correction.** `tide_correction` reads each strip's acquisition time from its metadata. It computes tides with the **CATS2008_v2023** model on a coarse grid (1 km by default; the model's native resolution is 2 km), interpolates them onto the DEM grid and subtracts them. Floating ice moves up and down with the tide, so this step matters over ice shelves. CATS2008_v2023 can be downloaded from https://www.usap-dc.org/view/dataset/601772. Point `tide_model_dir` to wherever you save it (e.g. `data/initial`).
 
-5. **Co-registration.** `coregistration` aligns each tide-corrected strip to CryoSat-2 POCA points and monthly SWATH elevations from around the acquisition date. It fits a weighted plane (an offset plus a tilt) in two passes, rejecting outliers after the first. If there are too few points for a plane, it falls back to an offset only. Each strip goes through QC checks: minimum number of POCA/SWATH points, footprint coverage, number of covered quadrants and maximum RMSE. The function writes the co-registered strips to `data/interim/region-{region_id}/REMA/co-registered-strips` and returns a QC table with a `status` for each strip.
+5. **Co-registration.** `coregistration` aligns each tide-corrected strip to CryoSat-2 POCA points and monthly SWATH elevations from around the acquisition date. It fits a weighted plane (an offset plus a tilt) in two passes, rejecting outliers after the first. If there are too few points for a plane, it falls back to an offset only. The function writes the co-registered strips to `data/interim/region-{region_id}/REMA/co-registered-strips`. It also returns a QC table, saved there as `coreg_quality_control.csv`, with the fit, the RMSEs and a `status` for each strip:
+   - `OK`: no flags raised
+   - `FLAGGED`: corrected, but at least one flag was raised
+   - `UNCORRECTED`: no reference observations over the strip
+   - `FAILED`: processing error
 
-The result is a set of cleaned, tide-corrected, altimetry-aligned REMA strips for the region, plus the QC table.
+   The flags, and the parameters that control them:
+
+   | Flag | Raised when | Parameter (default) |
+   |---|---|---|
+   | `LOW_POCA_COUNT` | too few POCA points | `min_poca` (10) |
+   | `LOW_SWATH_COUNT` | too few SWATH points | `min_swath` (20) |
+   | `LOW_FOOTPRINT_COVERAGE` | reference points cover too little of the footprint | `min_footprint_coverage` (0.20) |
+   | `POOR_SPATIAL_DISTRIBUTION` | reference points in too few of the footprint's quadrants | `min_covered_quadrants` (3) |
+   | `NO_REFERENCE_OBSERVATIONS` | no reference points at all (strip left uncorrected) | |
+   | `OFFSET_ONLY` | too few points for a plane, so only an offset was fitted | `min_points_for_plane` (10) |
+   | `HIGH_RMSE` | RMSE after correction too high | `max_rmse_m` (10 m) |
+   | `RMSE_INCREASED` | the weighted RMSE (the quantity the fit minimises) went up | |
+   | `HIGH_REJECTION` | too many points rejected in the second pass, which usually means the DEM itself is bad (e.g. clouds), not just offset | `max_rejected_fraction` (0.5) |
+
+6. **Quality control.** `coreg-qc.ipynb` checks the co-registration in two layers:
+   - **Layer 1: overview of all strips**, from the QC table: how often each flag is raised, RMSE before vs. after, the size of the correction (offset, tilt and the largest correction anywhere on the footprint), the offset over time, maps, and how the number of `OK` strips depends on the thresholds. The flags can be re-applied with other thresholds without re-running the co-registration. The layer ends with a shortlist of strips to inspect.
+   - **Layer 2: diagnostics for single strips.** For each strip, the reference points and fit are re-created exactly as in `coregistration` (`coreg_reference_points`), and a panel shows the DEM, the residuals before and after on a map, the correction plane, the residuals along and across the strip, and the residual distributions. Use `show_strip(...)` to look at any strip in the notebook. Panels for the shortlist are saved to `co-registered-strips/qc_panels/shortlist`, and panels for all strips can be saved with `save_all = True`.
+
+   Keep the thresholds and fit parameters at the top of `coreg-qc.ipynb` the same as in the `coregistration` call in `data-preprocessing.ipynb`.
+
+   Note that all RMSEs in the QC table are computed on the points the plane was fitted to. A large correction is not a problem in itself (some strips are tens of metres off and are corrected cleanly), but a large correction combined with many rejected points usually means a bad DEM.
+
+The result is a set of cleaned, tide-corrected, altimetry-aligned REMA strips for the region, plus the QC table and the QC notebook.
 
 ## Files
 
 - `data-preprocessing.ipynb`: the step-by-step workflow
+- `coreg-qc.ipynb`: quality control of the co-registration
 - `preprocessing_tools.py`: functions for AOI handling, bit masking, tide correction and co-registration
+- `qc_tools.py`: plotting functions for the co-registration diagnostics
 - `download-REMA-strips.py`: command-line script for downloading (and optionally resampling) the strips
 - `environment.yml`: conda environment with the required libraries
 
