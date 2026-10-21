@@ -1125,3 +1125,524 @@ def coregistration(region_id, projectDir, cores=3, qc_resolution_m=2000,
                       f'({row["quality_flags"]})', flush=True)
                 pd.DataFrame(rows).to_csv(output / 'coreg_quality_control.csv', index=False)
     return pd.DataFrame(rows)
+
+
+#################################################
+#######   Strip-to-strip adjustment      #######
+#################################################
+
+# All strips are block-averaged onto a common grid (aligned with the 500 m SWATH grid)
+# covering the AOI polygon plus a buffer. Bad DEMs are discarded based on their quality
+# inside the polygon (step 1). One plane per strip is then solved jointly from CryoSat-2
+# residuals and the height differences between strips that overlap within max_dt_days
+# (step 2). Finally, each strip is given a tier from the uncertainty of its correction
+# and its agreement with overlapping strips (step 3).
+
+from collections import defaultdict
+from rasterio.coords import BoundingBox
+from rasterio.windows import Window, WindowError, from_bounds as window_from_bounds
+
+
+def _nmad(values):
+    values = np.asarray(values)
+    if not len(values):
+        return np.nan
+    return float(1.4826 * np.median(np.abs(values - np.median(values))))
+
+
+def _adj_paths(region_id, projectDir):
+    root = Path(projectDir)
+    output = root / 'data/interim' / f'region-{region_id}' / 'REMA/adjusted-strips'
+    return dict(_coreg_paths(region_id, projectDir),
+                aoi_file=root / 'data/initial/regions' / f'region-{region_id}.shp',
+                output_dir=output, cache_dir=output / 'grid_cache')
+
+
+def _adj_grid(polygon, buffer_m, cell_m):
+    domain = polygon.buffer(buffer_m)
+    left, bottom, right, top = domain.bounds
+    left, bottom = np.floor(left / cell_m) * cell_m, np.floor(bottom / cell_m) * cell_m
+    right, top = np.ceil(right / cell_m) * cell_m, np.ceil(top / cell_m) * cell_m
+    nx, ny = int(round((right - left) / cell_m)), int(round((top - bottom) / cell_m))
+    xc = left + (np.arange(nx) + .5) * cell_m
+    yc = top - (np.arange(ny) + .5) * cell_m
+    xx, yy = np.meshgrid(xc, yc)
+    centres = gpd.points_from_xy(xx.ravel(), yy.ravel())
+    in_domain = np.asarray(domain.contains(centres)).reshape(ny, nx)
+    in_polygon = np.asarray(polygon.contains(centres)).reshape(ny, nx)
+    x0, y0 = polygon.centroid.x, polygon.centroid.y
+    return dict(bounds=BoundingBox(left, bottom, right, top), cell_m=cell_m, nx=nx, ny=ny,
+                xx=xx, yy=yy, gx=(xx - x0) / 1000, gy=(yy - y0) / 1000, x0=x0, y0=y0,
+                in_domain=in_domain, in_polygon=in_polygon, polygon=polygon, domain=domain)
+
+
+def _adj_block_mean(path, grid):
+    """Block-average a DEM onto the grid. Returns the mean and the valid-pixel fraction per cell."""
+    nx, ny, cell = grid['nx'], grid['ny'], grid['cell_m']
+    mean = np.full((ny, nx), np.nan, dtype='float32')
+    fraction = np.zeros((ny, nx), dtype='float32')
+    with rasterio.open(path) as src:
+        try:
+            window = window_from_bounds(*grid['bounds'], transform=src.transform)
+            window = window.round_offsets().round_lengths().intersection(Window(0, 0, src.width, src.height))
+        except WindowError:
+            return mean, fraction
+        dem = src.read(1, window=window, masked=True).astype('float64').filled(np.nan)
+        if src.nodata is not None and np.isfinite(src.nodata):
+            dem[dem == src.nodata] = np.nan
+        transform = src.window_transform(window)
+        pixels_per_cell = (cell / abs(src.res[0])) * (cell / abs(src.res[1]))
+    xs = transform.c + (np.arange(dem.shape[1]) + .5) * transform.a
+    ys = transform.f + (np.arange(dem.shape[0]) + .5) * transform.e
+    ix = np.floor((xs - grid['bounds'].left) / cell).astype('int64')
+    iy = np.floor((grid['bounds'].top - ys) / cell).astype('int64')
+    good = np.isfinite(dem) & ((iy >= 0) & (iy < ny))[:, None] & ((ix >= 0) & (ix < nx))[None, :]
+    flat = (iy[:, None] * nx + ix[None, :])[good]
+    count = np.bincount(flat, minlength=nx * ny).reshape(ny, nx)
+    total = np.bincount(flat, weights=dem[good], minlength=nx * ny).reshape(ny, nx)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        mean[:] = np.where(count > 0, total / count, np.nan)
+    fraction[:] = count / pixels_per_cell
+    return mean, fraction
+
+
+def _adj_reference(when, grid, valid, mean, paths):
+    """CryoSat-2 POCA points and SWATH cells in the domain, compared with the block-mean DEM."""
+    months = _coreg_months(when)
+    frames = [d for d in (_coreg_poca(months, grid['bounds'], paths['poca_dir']),
+                          _coreg_swath(months, grid['bounds'], paths['swath_file'])) if not d.empty]
+    if not frames:
+        return pd.DataFrame(columns=['iy', 'ix', 'h', 'source', 'residual'])
+    ref = pd.concat(frames, ignore_index=True)
+    ix = np.floor((ref.x.to_numpy() - grid['bounds'].left) / grid['cell_m']).astype('int64')
+    iy = np.floor((grid['bounds'].top - ref.y.to_numpy()) / grid['cell_m']).astype('int64')
+    inside = (ix >= 0) & (ix < grid['nx']) & (iy >= 0) & (iy < grid['ny'])
+    ref = ref.assign(ix=ix, iy=iy)[inside]
+    ref = ref[valid[ref.iy.to_numpy(), ref.ix.to_numpy()]]
+    ref = ref.assign(residual=mean[ref.iy.to_numpy(), ref.ix.to_numpy()] - ref.h.to_numpy())
+    return ref[['iy', 'ix', 'h', 'source', 'residual']].reset_index(drop=True)
+
+
+def _adj_process_strip(path_str, grid, paths, min_valid_fraction):
+    path = Path(path_str)
+    t1, t2 = get_rema_acquisition_times(paths['metadata_dir'] / f'{get_rema_base_name(path.name)}_mdf.txt')
+    when = pd.Timestamp(t1) + (pd.Timestamp(t2) - pd.Timestamp(t1)) / 2
+    when = when.tz_localize('UTC') if when.tzinfo is None else when.tz_convert('UTC')
+    mean, fraction = _adj_block_mean(path, grid)
+    valid = (fraction >= min_valid_fraction) & grid['in_domain']
+    ref = _adj_reference(when, grid, valid, mean, paths)
+    return path.name, when, mean, fraction, ref
+
+
+def _adj_ref_types(ref):
+    return ref.astype({'iy': 'int64', 'ix': 'int64', 'h': 'float64', 'residual': 'float64'})
+
+
+def _adj_load_stack(paths, grid, strips, cores, min_valid_fraction, overwrite):
+    """Grid all strips (cached, since this is the slow part)."""
+    cache = paths['cache_dir']
+    stack_file, ref_file = cache / 'stack.npz', cache / 'reference.parquet'
+    modified = max((paths['strip_dir'] / s).stat().st_mtime for s in strips)
+    if stack_file.exists() and ref_file.exists() and not overwrite:
+        stored = np.load(stack_file, allow_pickle=False)
+        same = ('modified' in stored.files and list(stored['strips']) == strips and stored['mean'].shape[1:] == (grid['ny'], grid['nx'])
+                and np.allclose(stored['bounds'], tuple(grid['bounds']))
+                and float(stored['min_valid_fraction']) == min_valid_fraction
+                and float(stored['modified']) == modified)
+        if same:
+            print('Using cached grid')
+            return (pd.to_datetime(stored['times'], utc=True), stored['mean'], stored['fraction'],
+                    _adj_ref_types(pd.read_parquet(ref_file)))
+    cache.mkdir(parents=True, exist_ok=True)
+    results = {}
+    with ProcessPoolExecutor(max_workers=cores) as pool:
+        futures = [pool.submit(_adj_process_strip, str(paths['strip_dir'] / s), grid, paths, min_valid_fraction)
+                   for s in strips]
+        for i, future in enumerate(as_completed(futures), 1):
+            name, when, mean, fraction, ref = future.result()
+            results[name] = (when, mean, fraction, ref.assign(strip=name))
+            print(f'[{i}/{len(strips)}] gridded {name}', flush=True)
+    times = pd.DatetimeIndex([results[s][0] for s in strips])
+    mean = np.stack([results[s][1] for s in strips])
+    fraction = np.stack([results[s][2] for s in strips])
+    ref = _adj_ref_types(pd.concat([results[s][3] for s in strips], ignore_index=True))
+    np.savez_compressed(stack_file, strips=np.array(strips), times=times.strftime('%Y-%m-%dT%H:%M:%S%z').to_numpy().astype(str),
+                        mean=mean, fraction=fraction, bounds=np.array(tuple(grid['bounds'])),
+                        min_valid_fraction=min_valid_fraction, modified=modified)
+    ref.to_parquet(ref_file)
+    return times, mean, fraction, ref
+
+
+def _robust_plane(x, y, z, n_iter=10):
+    """Plane fit with Tukey biweights. Returns the coefficients and the residuals."""
+    G = np.column_stack((x, y, np.ones(len(z))))
+    coeff = np.array([0., 0., np.median(z)])
+    for _ in range(n_iter):
+        r = z - G @ coeff
+        u = r / (4.685 * max(_nmad(r), 0.1))
+        w = np.where(np.abs(u) < 1, (1 - u ** 2) ** 2, 0.)
+        used = w > 0
+        if used.sum() < 3 or np.linalg.matrix_rank(G[used]) < 3:
+            coeff = np.array([0., 0., np.median(z[used] if used.any() else z)])
+            continue
+        coeff = np.linalg.lstsq(G * np.sqrt(w)[:, None], z * np.sqrt(w), rcond=None)[0]
+    return coeff, z - G @ coeff
+
+
+def _adj_quality(strips, fraction, ref, grid, config):
+    """Step 1: quality of each strip inside the polygon."""
+    rows = []
+    cells_in_polygon = grid['in_polygon'].sum()
+    for k, strip in enumerate(strips):
+        coverage = float(np.minimum(fraction[k], 1)[grid['in_polygon']].sum() / cells_in_polygon)
+        r = ref[ref.strip == strip]
+        r = r[grid['in_polygon'][r.iy, r.ix]]
+        row = dict(strip=strip, polygon_coverage=coverage, n_ref_polygon=len(r),
+                   ref_nmad_polygon=np.nan, ref_outlier_fraction_polygon=np.nan)
+        if len(r) >= config['min_ref_points']:
+            _, residual = _robust_plane(grid['gx'][r.iy, r.ix], grid['gy'][r.iy, r.ix], r.residual.to_numpy())
+            row.update(ref_nmad_polygon=_nmad(residual),
+                       ref_outlier_fraction_polygon=float(np.mean(np.abs(residual) > config['outlier_threshold_m'])))
+        reasons = []
+        if coverage < config['min_polygon_coverage']:
+            reasons.append('LOW_POLYGON_COVERAGE')
+        if row['ref_outlier_fraction_polygon'] > config['max_outlier_fraction']:
+            reasons.append('MANY_OUTLIERS')
+        if row['ref_nmad_polygon'] > config['max_nmad_m']:
+            reasons.append('HIGH_NMAD')
+        row['discard_reason'] = ';'.join(reasons)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _adj_pairs(strips, times, mean, fraction, grid, config):
+    """Overlapping pairs within max_dt_days, as cell-wise height differences."""
+    valid = (fraction >= config['min_valid_fraction']) & grid['in_domain'][None]
+    pairs = []
+    for i in range(len(strips)):
+        for j in range(i + 1, len(strips)):
+            dt = abs((times[j] - times[i]).total_seconds()) / 86400
+            if dt > config['max_dt_days']:
+                continue
+            common = valid[i] & valid[j]
+            if common.sum() < config['min_pair_cells']:
+                continue
+            iy, ix = np.nonzero(common)
+            pairs.append(dict(i=i, j=j, dt_days=dt, iy=iy, ix=ix,
+                              d=(mean[i][common] - mean[j][common]).astype('float64')))
+    return pairs
+
+
+def _adj_solve(n_strips, groups, config):
+    """Step 2: robust weighted least squares for one plane (a, b, c) per strip.
+
+    groups: dicts with 'kind' ('ref' or 'pair'), strip index 'i' (and 'j' for pairs),
+    grid offsets 'gx', 'gy' in km and observations 'z'.
+    """
+    n = 3 * n_strips
+    prior = np.tile([1 / config['prior_tilt_m_per_km'] ** 2, 1 / config['prior_tilt_m_per_km'] ** 2,
+                     1 / config['prior_offset_m'] ** 2], n_strips)
+    x = np.zeros(n)
+    for g in groups:
+        g['G'] = np.column_stack((g['gx'], g['gy'], np.ones(len(g['z']))))
+        g['inlier'] = np.ones(len(g['z']), dtype=bool)
+    for iteration in range(config['n_iterations']):
+        N = np.diag(prior)
+        b = np.zeros(n)
+        for g in groups:
+            si = slice(3 * g['i'], 3 * g['i'] + 3)
+            r = g['z'] - g['G'] @ x[si]
+            if g['kind'] == 'pair':
+                sj = slice(3 * g['j'], 3 * g['j'] + 3)
+                r = r + g['G'] @ x[sj]
+            if iteration > 0:
+                sigma = max(_nmad(r[g['inlier']]), config['sigma_floor_m'])
+                g['inlier'] = np.abs(r - np.median(r[g['inlier']])) <= config['rejection_sigma'] * sigma
+            sigma = max(_nmad(r[g['inlier']]), config['sigma_floor_m'])
+            n_in = g['inlier'].sum()
+            g['sigma'] = sigma
+            if n_in < 3:
+                continue
+            w = g['inlier'] / sigma ** 2 * min(1., config['n_eff'] / n_in)
+            GW = g['G'] * w[:, None]
+            GtWG, GtWz = GW.T @ g['G'], GW.T @ g['z']
+            N[si, si] += GtWG
+            b[si] += GtWz
+            if g['kind'] == 'pair':
+                N[sj, sj] += GtWG
+                N[si, sj] -= GtWG
+                N[sj, si] -= GtWG
+                b[sj] -= GtWz
+        x_new = np.linalg.solve(N, b)
+        converged = np.max(np.abs(x_new - x)) < 1e-4
+        x = x_new
+        if converged and iteration > 0:
+            break
+    return x.reshape(n_strips, 3), np.linalg.inv(N)
+
+
+def _adj_residuals(g, params):
+    r = g['z'] - g['G'] @ params[g['i']]
+    if g['kind'] == 'pair':
+        r = r + g['G'] @ params[g['j']]
+    return r
+
+
+def _adj_components(n_strips, pairs):
+    parent = list(range(n_strips))
+
+    def find(k):
+        while parent[k] != k:
+            parent[k] = parent[parent[k]]
+            k = parent[k]
+        return k
+    for p in pairs:
+        parent[find(p['i'])] = find(p['j'])
+    return np.array([find(k) for k in range(n_strips)])
+
+
+def _adj_write(input_path, output_path, coeff, grid):
+    """Write the adjusted DEM, cropped to the domain's bounding box."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp = output_path.with_name(output_path.stem + '.partial.tif')
+    a, b, c = coeff
+    try:
+        with rasterio.open(input_path) as src:
+            window = window_from_bounds(*grid['bounds'], transform=src.transform)
+            window = window.round_offsets().round_lengths().intersection(Window(0, 0, src.width, src.height))
+            transform = src.window_transform(window)
+            dem = src.read(1, window=window, masked=True).astype('float64').filled(np.nan)
+            if src.nodata is not None and np.isfinite(src.nodata):
+                dem[dem == src.nodata] = np.nan
+            profile = src.profile.copy()
+        x = transform.c + (np.arange(dem.shape[1]) + .5) * transform.a
+        y = transform.f + (np.arange(dem.shape[0]) + .5) * transform.e
+        plane = a * (x[None, :] - grid['x0']) / 1000 + b * (y[:, None] - grid['y0']) / 1000 + c
+        adjusted = np.where(np.isfinite(dem), dem - plane, -9999.)
+        profile.update(driver='GTiff', dtype='float32', compress='deflate', predictor=3, tiled=True,
+                       blockxsize=512, blockysize=512, nodata=-9999., width=dem.shape[1],
+                       height=dem.shape[0], transform=transform, BIGTIFF='IF_SAFER')
+        with rasterio.open(temp, 'w', **profile) as dst:
+            dst.write(adjusted.astype('float32'), 1)
+        os.replace(temp, output_path)
+    finally:
+        if temp.exists():
+            temp.unlink()
+
+
+def strip_adjustment(region_id, projectDir, cores=3, buffer_m=10000, cell_m=500,
+                     max_dt_days=10, min_valid_fraction=0.5, min_pair_cells=20,
+                     min_polygon_coverage=0.01, min_ref_points=20, outlier_threshold_m=15.0,
+                     max_outlier_fraction=0.5, max_nmad_m=15.0, n_eff=100,
+                     sigma_floor_m=0.5, rejection_sigma=3.0, prior_offset_m=100.0,
+                     prior_tilt_m_per_km=50.0, n_iterations=15,
+                     max_overlap_outlier_fraction=0.3, max_sigma_m=2.0, max_pair_offset_m=5.0,
+                     holdout_fraction=0.0, seed=0, write_dems=True, overwrite_grid=False):
+    """Discard bad DEMs, jointly adjust the strips, and assign tiers.
+
+    Works on the tide-corrected strips, inside the AOI polygon plus buffer_m.
+
+    Step 1 (discard): strips that cover less than min_polygon_coverage of the polygon, or
+    whose residuals against CryoSat-2 inside the polygon (after a robust plane fit) have
+    more than max_outlier_fraction beyond outlier_threshold_m or an NMAD above max_nmad_m.
+
+    Step 2 (adjust): one plane per strip, c + a*dx + b*dy with dx, dy in km from the
+    polygon centroid, solved jointly from CryoSat-2 residuals and from the height
+    differences of strips that overlap within max_dt_days. Observations are grouped
+    (per strip and source, and per pair); each group is weighted by 1/sigma^2 from its
+    robust spread, its total weight is capped at n_eff observations to account for
+    spatial correlation, and outliers beyond rejection_sigma are rejected. Weak priors
+    keep strips without any constraint at zero correction.
+
+    Step 3 (tiers): strips are removed one at a time, worst first, and the adjustment is
+    solved again each time, while any strip either disagrees with its overlapping strips
+    (more than max_overlap_outlier_fraction of the cells beyond outlier_threshold_m,
+    median over its pairs) or still has an NMAD above max_nmad_m against CryoSat-2. TIER_A strips are tied to CryoSat-2 (directly or through overlaps) and their
+    correction is known to within max_sigma_m everywhere in the polygon, and they agree
+    with all their overlapping strips to within max_pair_offset_m after the adjustment.
+    The remaining strips are TIER_B (fine for relative measurements); tier_b_reason
+    says why.
+
+    holdout_fraction > 0 leaves that fraction of the pairs out of the fit, to validate it.
+    Returns (strips, pairs) DataFrames, also saved as CSV in the output folder.
+    """
+    config = dict(max_dt_days=max_dt_days, min_valid_fraction=min_valid_fraction,
+                  min_pair_cells=min_pair_cells, min_polygon_coverage=min_polygon_coverage,
+                  min_ref_points=min_ref_points, outlier_threshold_m=outlier_threshold_m,
+                  max_outlier_fraction=max_outlier_fraction, max_nmad_m=max_nmad_m, n_eff=n_eff,
+                  sigma_floor_m=sigma_floor_m, rejection_sigma=rejection_sigma,
+                  prior_offset_m=prior_offset_m, prior_tilt_m_per_km=prior_tilt_m_per_km,
+                  n_iterations=n_iterations)
+    paths = _adj_paths(region_id, projectDir)
+    polygon = gpd.read_file(paths['aoi_file']).to_crs('EPSG:3031').geometry.union_all()
+    grid = _adj_grid(polygon, buffer_m, cell_m)
+    strips = sorted(p.name for p in paths['strip_dir'].glob('*.tif')
+                    if re.search(r'_dem(?:_[0-9.]+m)?\.tif$', p.name))
+    if not strips:
+        raise FileNotFoundError(f'No tide-corrected REMA strips found in {paths["strip_dir"]}')
+    print(f'Adjusting {len(strips)} REMA strips for {region_id} on a {grid["ny"]} x {grid["nx"]} grid '
+          f'of {cell_m} m cells')
+    times, mean, fraction, ref = _adj_load_stack(paths, grid, strips, cores, min_valid_fraction, overwrite_grid)
+
+    # Step 1: discard bad DEMs
+    table = _adj_quality(strips, fraction, ref, grid, config)
+    table.insert(1, 'acquisition_time_utc', times.strftime('%Y-%m-%dT%H:%M:%S%z'))
+    keep = (table.discard_reason == '').to_numpy()
+    print(f'Step 1: discarded {(~keep).sum()} of {len(strips)} strips')
+
+    all_pairs = _adj_pairs(strips, times, mean, fraction, grid, config)
+    rng = np.random.default_rng(seed)
+    held_out = rng.random(len(all_pairs)) < holdout_fraction
+
+    def solve(keep):
+        index = -np.ones(len(strips), dtype=int)
+        index[keep] = np.arange(keep.sum())
+        groups = []
+        for k in np.flatnonzero(keep):
+            r = ref[ref.strip == strips[k]]
+            for source, d in r.groupby('source'):
+                groups.append(dict(kind='ref', source=source, strip=k, i=index[k],
+                                   gx=grid['gx'][d.iy, d.ix], gy=grid['gy'][d.iy, d.ix],
+                                   z=d.residual.to_numpy()))
+        fit_pairs = [p for p, h in zip(all_pairs, held_out) if keep[p['i']] and keep[p['j']] and not h]
+        for p in fit_pairs:
+            groups.append(dict(kind='pair', pair=p, i=index[p['i']], j=index[p['j']],
+                               gx=grid['gx'][p['iy'], p['ix']], gy=grid['gy'][p['iy'], p['ix']], z=p['d']))
+        params, cov = _adj_solve(keep.sum(), groups, config)
+        return index, groups, fit_pairs, params, cov
+
+    # Step 2: joint adjustment
+    index, groups, fit_pairs, params, cov = solve(keep)
+
+    # Step 3: remove the worst remaining strip, one at a time, while any strip disagrees with its
+    # overlapping strips or still fits CryoSat-2 poorly after the adjustment, and solve again
+    def diagnose(groups, params):
+        pair_outliers, ref_after = defaultdict(list), defaultdict(list)
+        for g in groups:
+            r = _adj_residuals(g, params)
+            if g['kind'] == 'pair':
+                fraction_out = float(np.mean(np.abs(r - np.median(r)) > outlier_threshold_m))
+                pair_outliers[g['pair']['i']].append(fraction_out)
+                pair_outliers[g['pair']['j']].append(fraction_out)
+            else:
+                ref_after[g['strip']].append(r[g['inlier']])
+        overlap = np.full(len(strips), np.nan)
+        for k, values in pair_outliers.items():
+            overlap[k] = np.median(values)
+        ref_nmad = np.full(len(strips), np.nan)
+        for k, values in ref_after.items():
+            values = np.concatenate(values)
+            if len(values) >= min_ref_points:
+                ref_nmad[k] = _nmad(values)
+        return overlap, ref_nmad
+
+    removed = 0
+    while True:
+        overlap, ref_nmad = diagnose(groups, params)
+        badness = np.fmax(np.nan_to_num(overlap) / max_overlap_outlier_fraction,
+                          np.nan_to_num(ref_nmad) / max_nmad_m)
+        badness[~keep] = 0
+        worst = int(np.argmax(badness))
+        if badness[worst] <= 1:
+            break
+        table.loc[worst, 'discard_reason'] = ('OVERLAP_DISAGREEMENT'
+                                              if overlap[worst] / max_overlap_outlier_fraction >= ref_nmad[worst] / max_nmad_m
+                                              or np.isnan(ref_nmad[worst]) else 'POOR_FIT')
+        table.loc[worst, 'overlap_outlier_fraction'] = overlap[worst]
+        keep[worst] = False
+        removed += 1
+        index, groups, fit_pairs, params, cov = solve(keep)
+    overlap, _ = diagnose(groups, params)
+    table['overlap_outlier_fraction'] = np.where(keep, overlap, table.get('overlap_outlier_fraction', np.nan))
+    print(f'Step 3: discarded {removed} more strips that disagree with overlapping strips or fit poorly')
+
+    # Parameters, uncertainties and anchoring
+    corners = np.asarray(polygon.exterior.coords) if polygon.geom_type == 'Polygon' else \
+        np.vstack([np.asarray(p.exterior.coords) for p in polygon.geoms])
+    corners_km = np.column_stack(((corners[:, 0] - grid['x0']) / 1000, (corners[:, 1] - grid['y0']) / 1000,
+                                  np.ones(len(corners))))
+    n_ref = np.zeros(len(strips), dtype=int)
+    ref_nmad_before, ref_nmad_after = np.full(len(strips), np.nan), np.full(len(strips), np.nan)
+    by_strip = defaultdict(lambda: ([], []))
+    for g in groups:
+        if g['kind'] == 'ref':
+            r = _adj_residuals(g, params)
+            n_ref[g['strip']] += g['inlier'].sum()
+            by_strip[g['strip']][0].append(g['z'][g['inlier']])
+            by_strip[g['strip']][1].append(r[g['inlier']])
+    for k, (before, after) in by_strip.items():
+        ref_nmad_before[k], ref_nmad_after[k] = _nmad(np.concatenate(before)), _nmad(np.concatenate(after))
+    component = _adj_components(len(strips), fit_pairs)
+    anchored_components = {component[k] for k in np.flatnonzero(keep) if n_ref[k] >= min_ref_points}
+
+    cols = defaultdict(lambda: np.full(len(strips), np.nan))
+    n_pairs = np.zeros(len(strips), dtype=int)
+    for p in fit_pairs:
+        n_pairs[p['i']] += 1
+        n_pairs[p['j']] += 1
+    for k in np.flatnonzero(keep):
+        m = index[k]
+        a, b, c = params[m]
+        q = cov[3 * m:3 * m + 3, 3 * m:3 * m + 3]
+        cols['a_m_per_km'][k], cols['b_m_per_km'][k], cols['c_m'][k] = a, b, c
+        cols['sigma_c_m'][k] = np.sqrt(q[2, 2])
+        cols['sigma_polygon_max_m'][k] = np.sqrt(np.max(np.einsum('ij,jk,ik->i', corners_km, q, corners_km)))
+        plane = corners_km @ params[m]
+        cols['correction_min_m'][k], cols['correction_max_m'][k] = plane.min(), plane.max()
+    for name, values in cols.items():
+        table[name] = values
+    table['n_pairs'] = n_pairs
+    table['n_ref_used'] = n_ref
+    table['ref_nmad_before_m'], table['ref_nmad_after_m'] = ref_nmad_before, ref_nmad_after
+    table['anchored'] = [bool(keep[k] and component[k] in anchored_components) for k in range(len(strips))]
+    # Pair statistics before and after the adjustment (held-out pairs included)
+    pair_rows = []
+    for p, h in zip(all_pairs, held_out):
+        row = dict(strip_1=strips[p['i']], strip_2=strips[p['j']], dt_days=p['dt_days'], n_cells=len(p['d']),
+                   held_out=bool(h), used=bool(keep[p['i']] and keep[p['j']] and not h),
+                   median_before_m=float(np.median(p['d'])), nmad_before_m=_nmad(p['d']))
+        if keep[p['i']] and keep[p['j']]:
+            G = np.column_stack((grid['gx'][p['iy'], p['ix']], grid['gy'][p['iy'], p['ix']], np.ones(len(p['d']))))
+            r = p['d'] - G @ params[index[p['i']]] + G @ params[index[p['j']]]
+            row.update(median_after_m=float(np.median(r)), nmad_after_m=_nmad(r))
+        pair_rows.append(row)
+    pairs_table = pd.DataFrame(pair_rows)
+
+    # Tiers
+    worst_pair = np.full(len(strips), np.nan)
+    for row in pair_rows:
+        if row['used']:
+            for name in ('strip_1', 'strip_2'):
+                k = strips.index(row[name])
+                worst_pair[k] = np.fmax(worst_pair[k], abs(row['median_after_m']))
+    table['max_pair_offset_after_m'] = worst_pair
+    reasons = [[] for _ in strips]
+    for k in np.flatnonzero(keep):
+        if not table.anchored[k]:
+            reasons[k].append('NOT_ANCHORED')
+        elif table.sigma_polygon_max_m[k] > max_sigma_m:
+            reasons[k].append('HIGH_UNCERTAINTY')
+        if worst_pair[k] > max_pair_offset_m:
+            reasons[k].append('PAIR_OFFSET')
+    table['tier_b_reason'] = [';'.join(r) for r in reasons]
+    table['tier'] = np.where(~keep, 'DISCARDED', np.where(table.tier_b_reason == '', 'TIER_A', 'TIER_B'))
+    counts = table.tier.value_counts()
+    print('Step 3: ' + ', '.join(f'{counts.get(t, 0)} {t}' for t in ['TIER_A', 'TIER_B', 'DISCARDED']))
+
+
+    output = paths['output_dir']
+    output.mkdir(parents=True, exist_ok=True)
+    if write_dems:
+        with ProcessPoolExecutor(max_workers=cores) as pool:
+            futures = {}
+            for k in np.flatnonzero(keep):
+                out = output / f'{Path(strips[k]).stem}_adj.tif'
+                futures[pool.submit(_adj_write, paths['strip_dir'] / strips[k], out, params[index[k]], grid)] = k
+                table.loc[k, 'output_file'] = str(out)
+            for future in as_completed(futures):
+                future.result()
+        print(f'Wrote {len(futures)} adjusted strips to {output}')
+    suffix = f'_holdout{holdout_fraction:g}' if holdout_fraction > 0 else ''
+    table.to_csv(output / f'adjustment_strips{suffix}.csv', index=False)
+    pairs_table.to_csv(output / f'adjustment_pairs{suffix}.csv', index=False)
+    return table, pairs_table

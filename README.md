@@ -50,17 +50,28 @@ The full workflow is in `data-preprocessing.ipynb`. Most of the logic lives in `
    - **Layer 1: overview of all strips**, from the QC table: how often each flag is raised, RMSE before vs. after, the size of the correction (offset, tilt and the largest correction anywhere on the footprint), the offset over time, maps, and how the number of `OK` strips depends on the thresholds. The flags can be re-applied with other thresholds without re-running the co-registration. The layer ends with a shortlist of strips to inspect.
    - **Layer 2: diagnostics for single strips.** For each strip, the reference points and fit are re-created exactly as in `coregistration` (`coreg_reference_points`), and a panel shows the DEM, the residuals before and after on a map, the correction plane, the residuals along and across the strip, and the residual distributions. Use `show_strip(...)` to look at any strip in the notebook. Panels for the shortlist are saved to `co-registered-strips/qc_panels/shortlist`, and panels for all strips can be saved with `save_all = True`.
 
-   Keep the thresholds and fit parameters at the top of `coreg-qc.ipynb` the same as in the `coregistration` call in `data-preprocessing.ipynb`.
+   - **Layer 3: strip-to-strip adjustment** (step 7): the tiers, strips per year, the agreement between overlapping strips before and after the adjustment, a validation with held-out pairs, and the uncertainty of the corrections.
+
+   Keep the thresholds and fit parameters at the top of `coreg-qc.ipynb` the same as in the `coregistration` and `strip_adjustment` calls in `data-preprocessing.ipynb`.
 
    Note that all RMSEs in the QC table are computed on the points the plane was fitted to. A large correction is not a problem in itself (some strips are tens of metres off and are corrected cleanly), but a large correction combined with many rejected points usually means a bad DEM.
 
-The result is a set of cleaned, tide-corrected, altimetry-aligned REMA strips for the region, plus the QC table and the QC notebook.
+7. **Strip-to-strip adjustment.** `strip_adjustment` improves on the per-strip co-registration by also using the overlaps between strips. It works on the tide-corrected strips, inside the AOI polygon plus a buffer (`buffer_m`, 10 km), with all strips block-averaged onto a 500 m grid aligned with the SWATH grid. It has three steps:
+   1. **Discard bad DEMs**, judged inside the polygon: strips with almost no data there (`LOW_POLYGON_COVERAGE`), or whose residuals against CryoSat-2 have many outliers (`MANY_OUTLIERS`) or a high spread (`HIGH_NMAD`).
+   2. **Adjust all strips jointly**: one plane per strip, solved from the CryoSat-2 residuals together with the height differences between strips that overlap within `max_dt_days` (10 days, no correction for ice flow). Each group of observations (per strip and source, and per pair) is weighted by its spread, with its total weight capped at `n_eff` observations to account for spatial correlation, and outliers are rejected. `n_eff = 100` was calibrated with held-out pairs: the predicted uncertainties then match the misfit of pairs left out of the fit.
+   3. **Assign tiers.** Strips that disagree with their overlapping strips (`OVERLAP_DISAGREEMENT`) or still fit CryoSat-2 poorly (`POOR_FIT`) are removed one at a time, worst first, and the adjustment is solved again. The remaining strips are:
+      - `TIER_A`: tied to CryoSat-2 (directly or through overlaps), correction known to within `max_sigma_m` (2 m) everywhere in the polygon, and agreeing with all overlapping strips to within `max_pair_offset_m` (5 m). Use these for absolute elevations and elevation change.
+      - `TIER_B`: a good DEM, but not reliably tied to absolute heights (`tier_b_reason`: `NOT_ANCHORED`, `HIGH_UNCERTAINTY` or `PAIR_OFFSET`). Use these for relative measurements within a strip, such as channel geometry.
+
+   The adjusted strips (cropped to the polygon plus buffer, `*_adj.tif`) and the tables `adjustment_strips.csv` (one row per strip, with the tier, the reasons, the fitted plane and its uncertainty) and `adjustment_pairs.csv` (overlap statistics before and after) are written to `data/interim/region-{region_id}/REMA/adjusted-strips`. The gridded strips are cached in `grid_cache`, so changing the thresholds and running again only takes seconds.
+
+The result is a set of cleaned, tide-corrected, altimetry-aligned REMA strips for the region, sorted into tiers, plus the QC tables and the QC notebook.
 
 ## Files
 
 - `data-preprocessing.ipynb`: the step-by-step workflow
 - `coreg-qc.ipynb`: quality control of the co-registration
-- `preprocessing_tools.py`: functions for AOI handling, bit masking, tide correction and co-registration
+- `preprocessing_tools.py`: functions for AOI handling, bit masking, tide correction, co-registration and the strip-to-strip adjustment
 - `qc_tools.py`: plotting functions for the co-registration diagnostics
 - `download-REMA-strips.py`: command-line script for downloading (and optionally resampling) the strips
 - `environment.yml`: conda environment with the required libraries
