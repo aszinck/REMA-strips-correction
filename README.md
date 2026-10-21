@@ -61,9 +61,13 @@ The full workflow is in `data-preprocessing.ipynb`. Most of the logic lives in `
    2. **Adjust all strips jointly**: one plane per strip, solved from the CryoSat-2 residuals together with the height differences between strips that overlap within `max_dt_days` (10 days, no correction for ice flow). Each group of observations (per strip and source, and per pair) is weighted by its spread, with its total weight capped at `n_eff` observations to account for spatial correlation, and outliers are rejected. `n_eff = 100` was calibrated with held-out pairs: the predicted uncertainties then match the misfit of pairs left out of the fit.
    3. **Assign tiers.** Strips that disagree with their overlapping strips (`OVERLAP_DISAGREEMENT`) or still fit CryoSat-2 poorly (`POOR_FIT`) are removed one at a time, worst first, and the adjustment is solved again. The remaining strips are:
       - `TIER_A`: tied to CryoSat-2 (directly or through overlaps), correction known to within `max_sigma_m` (2 m) everywhere in the polygon, and agreeing with all overlapping strips to within `max_pair_offset_m` (5 m). Use these for absolute elevations and elevation change.
-      - `TIER_B`: a good DEM, but not reliably tied to absolute heights (`tier_b_reason`: `NOT_ANCHORED`, `HIGH_UNCERTAINTY` or `PAIR_OFFSET`). Use these for relative measurements within a strip, such as channel geometry.
+      - `TIER_A` strips must also have a pixel-scale noise of at most `max_noise_m` (0.5 m): the NMAD of the 10 m DEM minus its 70 m moving mean, inside the polygon. This catches speckle and blotches that average out at the 500 m grid and at the CryoSat-2 point spacing.
+      - `TIER_B`: a usable DEM, but not reliably tied to absolute heights or noisier than `max_noise_m` (`tier_b_reason`: `NOT_ANCHORED`, `HIGH_UNCERTAINTY`, `PAIR_OFFSET` or `HIGH_NOISE`). Use these for relative measurements within a strip, such as channel geometry.
+      - `TIER_C`: cross-track strips (stereo from two images taken on different days, `is_xtrack` in the REMA strip index) that would otherwise be `TIER_A` or `TIER_B`. Over the moving ice shelf (about 10 m/day) they are often noisy, and their time stamp is a mix of the two dates. Use them with care. Cross-track strips are left out of the joint adjustment, so they cannot affect the corrections of other strips. Each is fitted on its own afterwards, from its CryoSat-2 residuals and its overlaps with the along-track strips, whose planes are held fixed; overlaps between two cross-track strips are not used. Cross-track strips that still disagree with these overlaps or fit CryoSat-2 poorly are discarded.
 
    The adjusted strips (cropped to the polygon plus buffer, `*_adj.tif`) and the tables `adjustment_strips.csv` (one row per strip, with the tier, the reasons, the fitted plane and its uncertainty) and `adjustment_pairs.csv` (overlap statistics before and after) are written to `data/interim/region-{region_id}/REMA/adjusted-strips`. The gridded strips are cached in `grid_cache`, so changing the thresholds and running again only takes seconds.
+
+8. **Movie.** `qc_tools.dem_movie` makes an MP4 of the adjusted strips with one frame per month, on a fixed viridis colour range over a greyscale REMA mosaic. `TIER_B` strips are outlined in dashed orange and `TIER_C` strips in dotted pink. `qc_tools.plot_month_strips` plots all strips from one month (or a selection) individually, each zoomed to its strip, with its QC stats. Needs `ffmpeg` (included in the conda environment).
 
 The result is a set of cleaned, tide-corrected, altimetry-aligned REMA strips for the region, sorted into tiers, plus the QC tables and the QC notebook.
 
@@ -72,7 +76,7 @@ The result is a set of cleaned, tide-corrected, altimetry-aligned REMA strips fo
 - `data-preprocessing.ipynb`: the step-by-step workflow
 - `coreg-qc.ipynb`: quality control of the co-registration
 - `preprocessing_tools.py`: functions for AOI handling, bit masking, tide correction, co-registration and the strip-to-strip adjustment
-- `qc_tools.py`: plotting functions for the co-registration diagnostics
+- `qc_tools.py`: plotting functions for the co-registration diagnostics, the monthly movie and the per-strip figures
 - `download-REMA-strips.py`: command-line script for downloading (and optionally resampling) the strips
 - `environment.yml`: conda environment with the required libraries
 

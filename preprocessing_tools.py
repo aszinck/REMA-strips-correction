@@ -1155,6 +1155,7 @@ def _adj_paths(region_id, projectDir):
     output = root / 'data/interim' / f'region-{region_id}' / 'REMA/adjusted-strips'
     return dict(_coreg_paths(region_id, projectDir),
                 aoi_file=root / 'data/initial/regions' / f'region-{region_id}.shp',
+                index_file=root / 'data/initial/REMA/REMA_Strip_Index_s2s041.shp',
                 output_dir=output, cache_dir=output / 'grid_cache')
 
 
@@ -1223,7 +1224,29 @@ def _adj_reference(when, grid, valid, mean, paths):
     return ref[['iy', 'ix', 'h', 'source', 'residual']].reset_index(drop=True)
 
 
-def _adj_process_strip(path_str, grid, paths, min_valid_fraction):
+def _adj_noise(path, polygon, window_m):
+    """Pixel-scale noise inside the polygon: NMAD of the DEM minus its moving mean over window_m."""
+    from rasterio.mask import mask as mask_raster
+    from scipy.ndimage import uniform_filter
+    with rasterio.open(path) as src:
+        try:
+            dem, _ = mask_raster(src, [polygon], crop=True, filled=False)
+        except ValueError:
+            return np.nan
+        k = max(3, int(round(window_m / abs(src.res[0]))) | 1)
+    z = dem[0].astype('float64').filled(np.nan)
+    if src.nodata is not None and np.isfinite(src.nodata):
+        z[z == src.nodata] = np.nan
+    valid = np.isfinite(z)
+    filled = uniform_filter(valid.astype('float64'), k)
+    total = uniform_filter(np.where(valid, z, 0.), k)
+    complete = valid & (filled > 0.999)
+    if complete.sum() < 1000:
+        return np.nan
+    return _nmad(z[complete] - total[complete] / filled[complete])
+
+
+def _adj_process_strip(path_str, grid, paths, min_valid_fraction, noise_window_m):
     path = Path(path_str)
     t1, t2 = get_rema_acquisition_times(paths['metadata_dir'] / f'{get_rema_base_name(path.name)}_mdf.txt')
     when = pd.Timestamp(t1) + (pd.Timestamp(t2) - pd.Timestamp(t1)) / 2
@@ -1231,46 +1254,62 @@ def _adj_process_strip(path_str, grid, paths, min_valid_fraction):
     mean, fraction = _adj_block_mean(path, grid)
     valid = (fraction >= min_valid_fraction) & grid['in_domain']
     ref = _adj_reference(when, grid, valid, mean, paths)
-    return path.name, when, mean, fraction, ref
+    noise = _adj_noise(path, grid['polygon'], noise_window_m)
+    return path.name, when, mean, fraction, ref, noise
 
 
 def _adj_ref_types(ref):
     return ref.astype({'iy': 'int64', 'ix': 'int64', 'h': 'float64', 'residual': 'float64'})
 
 
-def _adj_load_stack(paths, grid, strips, cores, min_valid_fraction, overwrite):
+def _adj_load_stack(paths, grid, strips, cores, min_valid_fraction, noise_window_m, overwrite):
     """Grid all strips (cached, since this is the slow part)."""
     cache = paths['cache_dir']
     stack_file, ref_file = cache / 'stack.npz', cache / 'reference.parquet'
     modified = max((paths['strip_dir'] / s).stat().st_mtime for s in strips)
     if stack_file.exists() and ref_file.exists() and not overwrite:
         stored = np.load(stack_file, allow_pickle=False)
-        same = ('modified' in stored.files and list(stored['strips']) == strips and stored['mean'].shape[1:] == (grid['ny'], grid['nx'])
+        same = ('noise' in stored.files and list(stored['strips']) == strips and stored['mean'].shape[1:] == (grid['ny'], grid['nx'])
                 and np.allclose(stored['bounds'], tuple(grid['bounds']))
                 and float(stored['min_valid_fraction']) == min_valid_fraction
-                and float(stored['modified']) == modified)
+                and float(stored['modified']) == modified
+                and float(stored['noise_window_m']) == noise_window_m)
         if same:
             print('Using cached grid')
             return (pd.to_datetime(stored['times'], utc=True), stored['mean'], stored['fraction'],
-                    _adj_ref_types(pd.read_parquet(ref_file)))
+                    _adj_ref_types(pd.read_parquet(ref_file)), stored['noise'])
     cache.mkdir(parents=True, exist_ok=True)
     results = {}
     with ProcessPoolExecutor(max_workers=cores) as pool:
-        futures = [pool.submit(_adj_process_strip, str(paths['strip_dir'] / s), grid, paths, min_valid_fraction)
-                   for s in strips]
+        futures = [pool.submit(_adj_process_strip, str(paths['strip_dir'] / s), grid, paths, min_valid_fraction,
+                               noise_window_m) for s in strips]
         for i, future in enumerate(as_completed(futures), 1):
-            name, when, mean, fraction, ref = future.result()
-            results[name] = (when, mean, fraction, ref.assign(strip=name))
+            name, when, mean, fraction, ref, noise = future.result()
+            results[name] = (when, mean, fraction, ref.assign(strip=name), noise)
             print(f'[{i}/{len(strips)}] gridded {name}', flush=True)
     times = pd.DatetimeIndex([results[s][0] for s in strips])
     mean = np.stack([results[s][1] for s in strips])
     fraction = np.stack([results[s][2] for s in strips])
     ref = _adj_ref_types(pd.concat([results[s][3] for s in strips], ignore_index=True))
+    noise = np.array([results[s][4] for s in strips], dtype='float64')
     np.savez_compressed(stack_file, strips=np.array(strips), times=times.strftime('%Y-%m-%dT%H:%M:%S%z').to_numpy().astype(str),
                         mean=mean, fraction=fraction, bounds=np.array(tuple(grid['bounds'])),
-                        min_valid_fraction=min_valid_fraction, modified=modified)
+                        min_valid_fraction=min_valid_fraction, modified=modified,
+                        noise=noise, noise_window_m=noise_window_m)
     ref.to_parquet(ref_file)
-    return times, mean, fraction, ref
+    return times, mean, fraction, ref, noise
+
+
+def _adj_cross_track(strips, polygon, index_file):
+    """Whether each strip is cross-track stereo (images from different days), from the REMA strip index."""
+    lon_lat = gpd.GeoSeries([polygon], crs='EPSG:3031').to_crs('EPSG:4326').total_bounds
+    index = gpd.read_file(index_file, bbox=tuple(lon_lat), columns=['dem_id', 'is_xtrack'])
+    lookup = index.drop_duplicates('dem_id').set_index('dem_id')['is_xtrack']
+    is_xtrack = [lookup.get(get_rema_base_name(s)) for s in strips]
+    missing = sum(v is None for v in is_xtrack)
+    if missing:
+        print(f'Warning: {missing} strips not found in the strip index; treated as along-track')
+    return np.array([bool(v) if v is not None else False for v in is_xtrack])
 
 
 def _robust_plane(x, y, z, n_iter=10):
@@ -1437,7 +1476,7 @@ def strip_adjustment(region_id, projectDir, cores=3, buffer_m=10000, cell_m=500,
                      sigma_floor_m=0.5, rejection_sigma=3.0, prior_offset_m=100.0,
                      prior_tilt_m_per_km=50.0, n_iterations=15,
                      max_overlap_outlier_fraction=0.3, max_sigma_m=2.0, max_pair_offset_m=5.0,
-                     holdout_fraction=0.0, seed=0, write_dems=True, overwrite_grid=False):
+                     max_noise_m=0.5, noise_window_m=70, holdout_fraction=0.0, seed=0, write_dems=True, overwrite_grid=False):
     """Discard bad DEMs, jointly adjust the strips, and assign tiers.
 
     Works on the tide-corrected strips, inside the AOI polygon plus buffer_m.
@@ -1460,8 +1499,18 @@ def strip_adjustment(region_id, projectDir, cores=3, buffer_m=10000, cell_m=500,
     median over its pairs) or still has an NMAD above max_nmad_m against CryoSat-2. TIER_A strips are tied to CryoSat-2 (directly or through overlaps) and their
     correction is known to within max_sigma_m everywhere in the polygon, and they agree
     with all their overlapping strips to within max_pair_offset_m after the adjustment.
+    TIER_A strips must also have a pixel-scale noise (NMAD of the 10 m DEM minus its
+    moving mean over noise_window_m, inside the polygon) of at most max_noise_m.
     The remaining strips are TIER_B (fine for relative measurements); tier_b_reason
-    says why.
+    says why. Cross-track strips (stereo from images taken on different days, from the
+    REMA strip index) that would otherwise be TIER_A or TIER_B are TIER_C; they are
+    often noisy over the moving ice shelf, and their time stamp is ambiguous.
+
+    Cross-track strips do not take part in the joint adjustment, so they cannot affect
+    the other strips. Each is fitted on its own afterwards (step 2b), from its CryoSat-2
+    residuals and its overlaps with the along-track strips, whose planes are held fixed;
+    overlaps between two cross-track strips are not used. Their sigma does not include
+    the uncertainty of those fixed planes.
 
     holdout_fraction > 0 leaves that fraction of the pairs out of the fit, to validate it.
     Returns (strips, pairs) DataFrames, also saved as CSV in the output folder.
@@ -1482,11 +1531,15 @@ def strip_adjustment(region_id, projectDir, cores=3, buffer_m=10000, cell_m=500,
         raise FileNotFoundError(f'No tide-corrected REMA strips found in {paths["strip_dir"]}')
     print(f'Adjusting {len(strips)} REMA strips for {region_id} on a {grid["ny"]} x {grid["nx"]} grid '
           f'of {cell_m} m cells')
-    times, mean, fraction, ref = _adj_load_stack(paths, grid, strips, cores, min_valid_fraction, overwrite_grid)
+    times, mean, fraction, ref, noise = _adj_load_stack(paths, grid, strips, cores, min_valid_fraction,
+                                                        noise_window_m, overwrite_grid)
+    is_xtrack = _adj_cross_track(strips, polygon, paths['index_file'])
 
     # Step 1: discard bad DEMs
     table = _adj_quality(strips, fraction, ref, grid, config)
     table.insert(1, 'acquisition_time_utc', times.strftime('%Y-%m-%dT%H:%M:%S%z'))
+    table.insert(2, 'is_xtrack', is_xtrack)
+    table['noise_nmad_m'] = noise
     keep = (table.discard_reason == '').to_numpy()
     print(f'Step 1: discarded {(~keep).sum()} of {len(strips)} strips')
 
@@ -1506,13 +1559,15 @@ def strip_adjustment(region_id, projectDir, cores=3, buffer_m=10000, cell_m=500,
                                    z=d.residual.to_numpy()))
         fit_pairs = [p for p, h in zip(all_pairs, held_out) if keep[p['i']] and keep[p['j']] and not h]
         for p in fit_pairs:
-            groups.append(dict(kind='pair', pair=p, i=index[p['i']], j=index[p['j']],
+            groups.append(dict(kind='pair', pair=p, pair_strips=(p['i'], p['j']), i=index[p['i']], j=index[p['j']],
                                gx=grid['gx'][p['iy'], p['ix']], gy=grid['gy'][p['iy'], p['ix']], z=p['d']))
         params, cov = _adj_solve(keep.sum(), groups, config)
         return index, groups, fit_pairs, params, cov
 
-    # Step 2: joint adjustment
-    index, groups, fit_pairs, params, cov = solve(keep)
+    # Step 2: joint adjustment of the along-track strips. Cross-track strips are left out here, so
+    # they don't affect the other strips; they are fitted afterwards, one at a time (step 2b).
+    fit = keep & ~is_xtrack
+    index, groups, fit_pairs, params, cov = solve(fit)
 
     # Step 3: remove the worst remaining strip, one at a time, while any strip disagrees with its
     # overlapping strips or still fits CryoSat-2 poorly after the adjustment, and solve again
@@ -1520,10 +1575,10 @@ def strip_adjustment(region_id, projectDir, cores=3, buffer_m=10000, cell_m=500,
         pair_outliers, ref_after = defaultdict(list), defaultdict(list)
         for g in groups:
             r = _adj_residuals(g, params)
-            if g['kind'] == 'pair':
+            if 'pair' in g:
                 fraction_out = float(np.mean(np.abs(r - np.median(r)) > outlier_threshold_m))
-                pair_outliers[g['pair']['i']].append(fraction_out)
-                pair_outliers[g['pair']['j']].append(fraction_out)
+                for k in g['pair_strips']:
+                    pair_outliers[k].append(fraction_out)
             else:
                 ref_after[g['strip']].append(r[g['inlier']])
         overlap = np.full(len(strips), np.nan)
@@ -1536,25 +1591,80 @@ def strip_adjustment(region_id, projectDir, cores=3, buffer_m=10000, cell_m=500,
                 ref_nmad[k] = _nmad(values)
         return overlap, ref_nmad
 
+    def badness(overlap, ref_nmad):
+        return np.fmax(np.nan_to_num(overlap) / max_overlap_outlier_fraction, np.nan_to_num(ref_nmad) / max_nmad_m)
+
+    def discard(k, overlap, ref_nmad):
+        table.loc[k, 'discard_reason'] = ('OVERLAP_DISAGREEMENT'
+                                          if np.isnan(ref_nmad[k])
+                                          or overlap[k] / max_overlap_outlier_fraction >= ref_nmad[k] / max_nmad_m
+                                          else 'POOR_FIT')
+        table.loc[k, 'overlap_outlier_fraction'] = overlap[k]
+        keep[k] = False
+
     removed = 0
     while True:
         overlap, ref_nmad = diagnose(groups, params)
-        badness = np.fmax(np.nan_to_num(overlap) / max_overlap_outlier_fraction,
-                          np.nan_to_num(ref_nmad) / max_nmad_m)
-        badness[~keep] = 0
-        worst = int(np.argmax(badness))
-        if badness[worst] <= 1:
+        bad = badness(overlap, ref_nmad)
+        bad[~fit] = 0
+        worst = int(np.argmax(bad))
+        if bad[worst] <= 1:
             break
-        table.loc[worst, 'discard_reason'] = ('OVERLAP_DISAGREEMENT'
-                                              if overlap[worst] / max_overlap_outlier_fraction >= ref_nmad[worst] / max_nmad_m
-                                              or np.isnan(ref_nmad[worst]) else 'POOR_FIT')
-        table.loc[worst, 'overlap_outlier_fraction'] = overlap[worst]
-        keep[worst] = False
+        discard(worst, overlap, ref_nmad)
+        fit[worst] = False
         removed += 1
-        index, groups, fit_pairs, params, cov = solve(keep)
-    overlap, _ = diagnose(groups, params)
-    table['overlap_outlier_fraction'] = np.where(keep, overlap, table.get('overlap_outlier_fraction', np.nan))
+        index, groups, fit_pairs, params, cov = solve(fit)
     print(f'Step 3: discarded {removed} more strips that disagree with overlapping strips or fit poorly')
+
+    # Results per strip: plane, covariance, and the observation groups used for it
+    plane_of = {k: params[index[k]] for k in np.flatnonzero(fit)}
+    cov_of = {k: cov[3 * index[k]:3 * index[k] + 3, 3 * index[k]:3 * index[k] + 3] for k in np.flatnonzero(fit)}
+    groups_of = defaultdict(list)
+    for g in groups:
+        if 'pair' in g:
+            for k in g['pair_strips']:
+                groups_of[k].append(g)
+        else:
+            groups_of[g['strip']].append(g)
+    overlap, _ = diagnose(groups, params)
+    used_pairs = list(fit_pairs)
+
+    # Step 2b: each cross-track strip on its own, from its CryoSat-2 residuals and its overlaps with
+    # the along-track strips, whose planes are held fixed. Overlaps between two cross-track strips
+    # are not used. Cross-track strips that disagree with these overlaps or fit poorly are discarded.
+    removed_xtrack = 0
+    for k in np.flatnonzero(keep & is_xtrack):
+        own = []
+        r = ref[ref.strip == strips[k]]
+        for source, d in r.groupby('source'):
+            own.append(dict(kind='ref', source=source, strip=k, i=0,
+                            gx=grid['gx'][d.iy, d.ix], gy=grid['gy'][d.iy, d.ix], z=d.residual.to_numpy()))
+        k_pairs = [p for p, h in zip(all_pairs, held_out) if not h and k in (p['i'], p['j'])
+                   and fit[p['j'] if p['i'] == k else p['i']]]
+        for p in k_pairs:
+            other = p['j'] if p['i'] == k else p['i']
+            gx, gy = grid['gx'][p['iy'], p['ix']], grid['gy'][p['iy'], p['ix']]
+            fixed = np.column_stack((gx, gy, np.ones(len(gx)))) @ plane_of[other]
+            # d = h_i - h_j, so the cross-track plane is observed as d + p_j (k = i) or p_i - d (k = j)
+            z = p['d'] + fixed if p['i'] == k else fixed - p['d']
+            own.append(dict(kind='ref', source='PAIR', pair=p, pair_strips=(k,), strip=k, i=0, gx=gx, gy=gy, z=z))
+        if not own:
+            # Nothing to fit to: no correction, with the prior as uncertainty (not anchored)
+            plane_of[k] = np.zeros(3)
+            cov_of[k] = np.diag([prior_tilt_m_per_km ** 2, prior_tilt_m_per_km ** 2, prior_offset_m ** 2])
+            continue
+        k_params, k_cov = _adj_solve(1, own, config)
+        k_overlap, k_ref_nmad = diagnose(own, k_params)
+        if badness(k_overlap, k_ref_nmad)[k] > 1:
+            discard(k, k_overlap, k_ref_nmad)
+            removed_xtrack += 1
+            continue
+        plane_of[k], cov_of[k], groups_of[k] = k_params[0], k_cov, own
+        overlap[k] = k_overlap[k]
+        used_pairs += k_pairs
+    print(f'Step 2b: fitted {sum(len(groups_of[k]) > 0 for k in np.flatnonzero(keep & is_xtrack))} cross-track strips on their own, '
+          f'discarded {removed_xtrack} that disagree with overlapping strips or fit poorly')
+    table['overlap_outlier_fraction'] = np.where(keep, overlap, table.get('overlap_outlier_fraction', np.nan))
 
     # Parameters, uncertainties and anchoring
     corners = np.asarray(polygon.exterior.coords) if polygon.geom_type == 'Polygon' else \
@@ -1563,47 +1673,54 @@ def strip_adjustment(region_id, projectDir, cores=3, buffer_m=10000, cell_m=500,
                                   np.ones(len(corners))))
     n_ref = np.zeros(len(strips), dtype=int)
     ref_nmad_before, ref_nmad_after = np.full(len(strips), np.nan), np.full(len(strips), np.nan)
-    by_strip = defaultdict(lambda: ([], []))
-    for g in groups:
-        if g['kind'] == 'ref':
-            r = _adj_residuals(g, params)
-            n_ref[g['strip']] += g['inlier'].sum()
-            by_strip[g['strip']][0].append(g['z'][g['inlier']])
-            by_strip[g['strip']][1].append(r[g['inlier']])
-    for k, (before, after) in by_strip.items():
-        ref_nmad_before[k], ref_nmad_after[k] = _nmad(np.concatenate(before)), _nmad(np.concatenate(after))
+    for k, k_groups in groups_of.items():
+        before, after = [], []
+        for g in k_groups:
+            if g['kind'] == 'ref' and 'pair' not in g:
+                r = g['z'] - g['G'] @ plane_of[k]
+                n_ref[k] += g['inlier'].sum()
+                before.append(g['z'][g['inlier']])
+                after.append(r[g['inlier']])
+        if before:
+            ref_nmad_before[k], ref_nmad_after[k] = _nmad(np.concatenate(before)), _nmad(np.concatenate(after))
     component = _adj_components(len(strips), fit_pairs)
-    anchored_components = {component[k] for k in np.flatnonzero(keep) if n_ref[k] >= min_ref_points}
+    anchored_components = {component[k] for k in np.flatnonzero(fit) if n_ref[k] >= min_ref_points}
+    anchored = np.array([bool(fit[k] and component[k] in anchored_components) for k in range(len(strips))])
+    for k in np.flatnonzero(keep & is_xtrack):
+        partners = [p['j'] if p['i'] == k else p['i'] for p in used_pairs if k in (p['i'], p['j'])]
+        anchored[k] = n_ref[k] >= min_ref_points or any(anchored[j] for j in partners)
 
     cols = defaultdict(lambda: np.full(len(strips), np.nan))
     n_pairs = np.zeros(len(strips), dtype=int)
-    for p in fit_pairs:
-        n_pairs[p['i']] += 1
-        n_pairs[p['j']] += 1
-    for k in np.flatnonzero(keep):
-        m = index[k]
-        a, b, c = params[m]
-        q = cov[3 * m:3 * m + 3, 3 * m:3 * m + 3]
-        cols['a_m_per_km'][k], cols['b_m_per_km'][k], cols['c_m'][k] = a, b, c
+    for p in used_pairs:
+        for k in (p['i'], p['j']):
+            n_pairs[k] += keep[k]
+    for k, plane in plane_of.items():
+        q = cov_of[k]
+        cols['a_m_per_km'][k], cols['b_m_per_km'][k], cols['c_m'][k] = plane
         cols['sigma_c_m'][k] = np.sqrt(q[2, 2])
         cols['sigma_polygon_max_m'][k] = np.sqrt(np.max(np.einsum('ij,jk,ik->i', corners_km, q, corners_km)))
-        plane = corners_km @ params[m]
-        cols['correction_min_m'][k], cols['correction_max_m'][k] = plane.min(), plane.max()
+        corrections = corners_km @ plane
+        cols['correction_min_m'][k], cols['correction_max_m'][k] = corrections.min(), corrections.max()
     for name, values in cols.items():
         table[name] = values
     table['n_pairs'] = n_pairs
     table['n_ref_used'] = n_ref
     table['ref_nmad_before_m'], table['ref_nmad_after_m'] = ref_nmad_before, ref_nmad_after
-    table['anchored'] = [bool(keep[k] and component[k] in anchored_components) for k in range(len(strips))]
+    table['anchored'] = anchored & keep
+
     # Pair statistics before and after the adjustment (held-out pairs included)
+    used_ids = {id(p) for p in used_pairs}
     pair_rows = []
     for p, h in zip(all_pairs, held_out):
+        role = ('not used' if id(p) not in used_ids else
+                'cross-track' if is_xtrack[p['i']] or is_xtrack[p['j']] else 'joint')
         row = dict(strip_1=strips[p['i']], strip_2=strips[p['j']], dt_days=p['dt_days'], n_cells=len(p['d']),
-                   held_out=bool(h), used=bool(keep[p['i']] and keep[p['j']] and not h),
+                   held_out=bool(h), used=id(p) in used_ids, role=role,
                    median_before_m=float(np.median(p['d'])), nmad_before_m=_nmad(p['d']))
-        if keep[p['i']] and keep[p['j']]:
+        if p['i'] in plane_of and p['j'] in plane_of:
             G = np.column_stack((grid['gx'][p['iy'], p['ix']], grid['gy'][p['iy'], p['ix']], np.ones(len(p['d']))))
-            r = p['d'] - G @ params[index[p['i']]] + G @ params[index[p['j']]]
+            r = p['d'] - G @ plane_of[p['i']] + G @ plane_of[p['j']]
             row.update(median_after_m=float(np.median(r)), nmad_after_m=_nmad(r))
         pair_rows.append(row)
     pairs_table = pd.DataFrame(pair_rows)
@@ -1614,7 +1731,9 @@ def strip_adjustment(region_id, projectDir, cores=3, buffer_m=10000, cell_m=500,
         if row['used']:
             for name in ('strip_1', 'strip_2'):
                 k = strips.index(row[name])
-                worst_pair[k] = np.fmax(worst_pair[k], abs(row['median_after_m']))
+                # A pair with a cross-track strip only counts against the cross-track strip
+                if row['role'] == 'joint' or is_xtrack[k]:
+                    worst_pair[k] = np.fmax(worst_pair[k], abs(row['median_after_m']))
     table['max_pair_offset_after_m'] = worst_pair
     reasons = [[] for _ in strips]
     for k in np.flatnonzero(keep):
@@ -1624,10 +1743,14 @@ def strip_adjustment(region_id, projectDir, cores=3, buffer_m=10000, cell_m=500,
             reasons[k].append('HIGH_UNCERTAINTY')
         if worst_pair[k] > max_pair_offset_m:
             reasons[k].append('PAIR_OFFSET')
+        if not noise[k] <= max_noise_m:
+            reasons[k].append('HIGH_NOISE')
     table['tier_b_reason'] = [';'.join(r) for r in reasons]
-    table['tier'] = np.where(~keep, 'DISCARDED', np.where(table.tier_b_reason == '', 'TIER_A', 'TIER_B'))
+    tier = np.where(table.tier_b_reason == '', 'TIER_A', 'TIER_B')
+    tier = np.where(is_xtrack, 'TIER_C', tier)
+    table['tier'] = np.where(~keep, 'DISCARDED', tier)
     counts = table.tier.value_counts()
-    print('Step 3: ' + ', '.join(f'{counts.get(t, 0)} {t}' for t in ['TIER_A', 'TIER_B', 'DISCARDED']))
+    print('Step 3: ' + ', '.join(f'{counts.get(t, 0)} {t}' for t in ['TIER_A', 'TIER_B', 'TIER_C', 'DISCARDED']))
 
 
     output = paths['output_dir']
@@ -1637,7 +1760,7 @@ def strip_adjustment(region_id, projectDir, cores=3, buffer_m=10000, cell_m=500,
             futures = {}
             for k in np.flatnonzero(keep):
                 out = output / f'{Path(strips[k]).stem}_adj.tif'
-                futures[pool.submit(_adj_write, paths['strip_dir'] / strips[k], out, params[index[k]], grid)] = k
+                futures[pool.submit(_adj_write, paths['strip_dir'] / strips[k], out, plane_of[k], grid)] = k
                 table.loc[k, 'output_file'] = str(out)
             for future in as_completed(futures):
                 future.result()
